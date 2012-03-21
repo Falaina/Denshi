@@ -1,3 +1,6 @@
+**Most active development will occur over at [Naoko](https://github.com/Suwako/Naoko), 
+Suwako's fork of Denshi. I'll try to track non-animu specific changes hover**
+
 # Denshi - A prototype Synchtube bot
 
 ## Requirements
