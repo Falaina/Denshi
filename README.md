@@ -1,5 +1,4 @@
-**Most active development will occur over at [Naoko](https://github.com/Suwako/Naoko), 
-Suwako's fork of Denshi. I'll try to track non-animu specific changes hover**
+## Most active development will occur over at [Naoko](https://github.com/Suwako/Naoko), Suwako's fork of Denshi. I'll try to track non-animu specific changes here, however.
 
 # Denshi - A prototype Synchtube bot
 
