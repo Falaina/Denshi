@@ -61,6 +61,7 @@ class WebSocket(object):
         self.logger.setLevel(logLevel)
         self.pkt_logger =logging.getLogger("websocket.pkt")
         self.pkt_logger.setLevel(logLevel)
+        self.closing = False
 
     def handle_read(self):
         if state == self._CONNECTING:
@@ -91,7 +92,7 @@ class WebSocket(object):
 
     def send(self, data):
         frame = '\x00' + data + '\xff'
-        self.pkt_logger.debug("Sending frame: %s", repr(frame))
+        self.pkt_logger.debug("Sending frame: %s", frame)
         self.sock.sendall(frame)
 
     def createSecretKey(self):
@@ -192,7 +193,7 @@ class WebSocket(object):
         if (frame_type & 0x80) == 0x80: # Special frame type?
             raise Exception("No clue")
         frame = []
-        while True:
+        while not self.closing:
             c = self.sock.recv(1)
             if c == '\xff':
                 frame = "".join(frame)
@@ -200,12 +201,15 @@ class WebSocket(object):
                 return frame
             else:
                 frame.append(c)
+        else:
+            self.sock.close()
 
     def recvFrame(self):
         return self.readFrame()
 
     def close(self):
-        self.sock.close()
+        self.sock.settimeout(0)
+        self.closing = True
 
 # Simple Record Types for variable synchtube constructs
 SynchtubeUser = namedtuple('SynchtubeUser',
@@ -282,9 +286,11 @@ class SocketIOClient(object):
         return self.sid
 
     def close(self):
-        self.ws.close()
         if self.heartBeatEvent:
             self.sched.cancel(self.heartBeatEvent)
+            self.logger.info ("Heartbeats Stopped")
+        self.ws.close()
+
 
     def send(self, msg_type=3, sock_id='', end_pt='', data=''):
         buf = "%s:%s:%s:%s" % (msg_type, sock_id, end_pt, data)
@@ -292,7 +298,6 @@ class SocketIOClient(object):
         self.ws.send(buf)
 
     def sendHeartBeat(self, next_sec=None):
-        #self.logger.debug("beat")
         if next_sec:
             self.heartBeatEvent = self.sched.enter(next_sec, 1, SocketIOClient.sendHeartBeat, [self, next_sec])
         if not self.ws:
@@ -341,6 +346,9 @@ class SocketIOClient(object):
 #Built upon the instructions provided by http://wiki.shellium.org/w/Writing_an_IRC_bot_in_Python
 class IRCClient(object):
     def __init__ (self, server, channel, nick, pw):
+        # NOTE: Doesn't currently confirm any joins, nick changes, or identifies
+        # If an IRC name is set and this fails, the entire bot will restart
+        # IRC pings can be unpredictable, so a timeout (except when closing) isn't practical
         self.logger = logging.getLogger("ircclient")
         self.logger.setLevel(logLevel)
         self.server = server
@@ -350,7 +358,7 @@ class IRCClient(object):
         #self.logger.debug ("%s %s %s %s", self.server, self.channel, self.nick, pw)
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.connect((self.server, 6667)) # Here we connect to the server using port 6667
-        self.send("USER "+ self.nick +" "+ self.nick +" "+ self.nick +" :test\n") # user authentication
+        self.send("USER "+ self.nick +" "+ self.nick +" "+ self.nick +" :"+ self.nick +"\n") # user aut
         self.send("NICK "+ self.nick +"\n") # here we actually assign the nick to the bot
         if pw:
             self.send ("PRIVMSG nickserv :id " + pw + "\n")
@@ -383,13 +391,13 @@ class IRCClient(object):
 #   ["TYPE", DATA]
 # e.g., The self message (describes current client)
 #   ["self" ["bbc2c922",22262,true,"jpg",false,true,21]]
-# Which describes a particular connection for the user Denshi
+# Which describes a particular connection for the user Naoko
 # (uid 22262). The first field is the session identifier,
 # second is uid, third is whether or not client is authenticated
 # fourth is avatar type, and so on.
 class SynchtubeClient(object):
     _ST_IP = "173.255.204.78"
-    _HEADERS = {'User-Agent' : 'DenshiBot',
+    _HEADERS = {'User-Agent' : 'NaokoBot',
                 'Accept' : 'text/html,application/xhtml+xml,application/xml;',
                 'Host' : 'www.synchtube.com',
                 'Connection' : 'keep-alive',
@@ -489,6 +497,35 @@ class SynchtubeClient(object):
         else:
             self.irc_queue = deque(maxlen=0)
 
+        self.stthread = threading.Thread (target=SynchtubeClient._stloop, args=[self])
+        self.stthread.start()
+
+        status = True
+        while status:
+            # Sleeping first lets everything get initialized
+            # The parent process will wait
+            time.sleep(30)
+            try:
+                status = self.stthread.isAlive()
+                status = status and (not irc_nick or self.ircthread.isAlive())
+                status = status and (not irc_nick or self.bridgethread.isAlive())
+                status = status and self.client.hbthread.isAlive()
+            except Exception as e:
+                self.logger.error (e)
+                status = False
+            self.logger.debug ("Status is %s", status)
+            #else: self.sendStatus()
+            #lastMessage = time.time()
+            # Sleep for 30 seconds
+            #while (time.time() < lastMessage + 30):
+                #time.sleep(lastMessage - time.time() + 30)
+        else:
+            self.close()
+
+    def _stloop(self):
+        client = self.client
+        client.connect()
+>>>>>>> 3767321... Minor changes
         while not self.closing:
             data = client.recvMessage()
             try:
@@ -579,7 +616,15 @@ class SynchtubeClient(object):
         try: return self.userlist[(i for i in self.userlist if self.userlist[i].nick.lower() == nick.lower()).next()]
         except StopIteration: return None
 
+    def getVideoIndexById(self, vid):
+        try: return (idx for idx, ele in enumerate(self.vidlist) if ele.v_sid == vid).next()
+        except StopIteration: return -1
+
     def close(self):
+        self.closeLock.acquire()
+        if self.closing:
+            self.closeLock.release()
+            return
         self.closing = True
 
     def addMedia(self, tag, data):
@@ -640,7 +685,7 @@ class SynchtubeClient(object):
             self.logger.exception("Failure to delete user %s from %s", data, self.userlist)
 
     def sendChat(self, msg):
-        self.logger.info(msg)
+        self.logger.debug(msg)
         self.send("<", msg)
 
     def send(self, tag='', data=''):
