@@ -23,18 +23,31 @@ from urllib2 import Request, urlopen
 from collections import namedtuple, deque
 from pprint import pprint
 import ConfigParser
+import random
 
-# Default Timeout.
-TIMEOUT   = 25
+from settings import *
 
-#Logging Level
-logLevel = logging.WARNING
-
-# Set up logging
-logging.basicConfig(format='%(name)-15s:%(levelname)-8s - %(message)s')
-logger = logging.getLogger("socket.io client")
-logger.setLevel(logLevel)
-(info, debug, warning, error) = (logger.info, logger.debug, logger.warning, logger.error)
+eight_choices = [
+    "It is certain",
+    "It is decidedly so",
+    "Without a doubt",
+    "Yes - definitely",
+    "You may rely on it",
+    "As I see it, yes",
+    "Most likely",
+    "Outlook good",
+    "Signs point to yes",
+    "Yes",
+    "Reply hazy, try again",
+    "Ask again later",
+    "Better not tell you now",
+    "Cannot predict now",
+    "Concentrate and ask again",
+    "Don't count on it",
+    "My reply is no",
+    "My sources say no",
+    "Outlook not so good",
+    "Very doubtful"]
 
 # Implementation of WebSocket client as per draft-ietf-hybi-thewebsocketprotocol-00
 # http://tools.ietf.org/html/draft-ietf-hybi-thewebsocketprotocol-00
@@ -197,7 +210,7 @@ class WebSocket(object):
             c = self.sock.recv(1)
             if c == '\xff':
                 frame = "".join(frame)
-                self.pkt_logger.debug("Received frame: %s", frame)
+                self.pkt_logger.debug("Received frame: %r", frame)
                 return frame
             else:
                 frame.append(c)
@@ -315,7 +328,7 @@ class SocketIOClient(object):
         self.logger.debug("Received session ID: %s", sid)
         sock_resource = "/%s/%s/%s/%s?%s" % ("socket.io",
                                              1,
-                                             "flashsocket",
+                                             "websocket",
                                              sid,
                                              urllib.urlencode(self.params))
         self.ws = WebSocket(self.host, self.port, sock_resource)
@@ -527,7 +540,7 @@ class SynchtubeClient(object):
         client.connect()
 >>>>>>> 3767321... Minor changes
         while not self.closing:
-            data = client.recvMessage()
+            (valid, data) = self.filterString(client.recvMessage())
             try:
                 data = json.loads(data)
             except ValueError as e:
@@ -610,6 +623,11 @@ class SynchtubeClient(object):
                                 "mute"              : self.mute,
                                 "unmute"            : self.unmute,
                                 "status"            : self.status,
+                                "lock"              : self.lock,
+                                "unlock"            : self.unlock,
+                                "choose"            : self.choose,
+                                "ask"               : self.ask,
+                                "8ball"             : self.eightBall,
                                 "kick"              : self.kick}
 
     def getUserByNick(self, nick):
@@ -620,6 +638,12 @@ class SynchtubeClient(object):
         try: return (idx for idx, ele in enumerate(self.vidlist) if ele.v_sid == vid).next()
         except StopIteration: return -1
 
+    # Enqueues a message for sending to both IRC and Synchtube
+    # This should not be used for bridging chat between IRC and Synchtube
+    def enqueueMsg(self, msg):
+        self.irc_queue.append(msg)
+        self.st_queue.append(msg)
+
     def close(self):
         self.closeLock.acquire()
         if self.closing:
@@ -629,6 +653,27 @@ class SynchtubeClient(object):
 
     def addMedia(self, tag, data):
         self._addVideo(data)
+
+    def removeMedia(self, tag, data):
+        self._removeVideo(data)
+
+    def moveMedia(self, tag, data):
+        after = None
+        if "after" in data:
+            after = data["after"]
+        self._moveVideo(data["id"], after)
+
+    # Kicks a user for changing to an invalid name
+    # TODO -- Test Banning and upgrade this to a nameBan
+    def nameKick(self, sid):
+        if self.pending.has_key(sid): return
+        self.pending[sid] = True
+        user = self.userlist[sid]
+        self.logger.info("Attempted kick of %s for invalid characters in name", user.nick)
+        reason = "Name [%s] contains illegal characters" % user.nick
+        def kickUser():
+            self._kickUser(sid, reason)
+        self.asLeader(kickUser)
 
     def changeMedia(self, tag, data):
         self.logger.info("Ignoring cm (change media) message: %s" % (data))
@@ -641,6 +686,18 @@ class SynchtubeClient(object):
         if user.mod:
             self.muted = False
 
+    def lock (self, command, user, data):
+        if not user.mod: return
+        def changeLock():
+            self.send ("lock?", True)
+        self.asLeader(changeLock)
+
+    def unlock (self, command, user, data):
+        if not user.mod: return
+        def changeLock():
+            self.send ("lock?", False)
+        self.asLeader(changeLock)
+
     def status (self, command, user, data):
         msg = "Status = ["
         if not self.muted:
@@ -651,6 +708,33 @@ class SynchtubeClient(object):
     def kill(self, command, user, data):
         if user.mod:
             self.close()
+
+    def choose(self, command, user, data):
+        if not data: return
+        choices = data
+        if type (choices) is not str and type(choices) is not unicode:
+            choices = str(choices)
+        choices = choices.strip()
+        if len (choices) == 0: return
+        self.enqueueMsg("[Choose: %s] %s" % (choices, random.choice(choices.split())))
+
+    def ask(self, command, user, data):
+        if not data: return
+        question = data
+        if type (question) is not str and type(question) is not unicode:
+            question = str(question)
+        question = question.strip()
+        if len (question) == 0: return
+        self.enqueueMsg("[%s] %s" % (question, random.choice(["Yes", "No"])))
+
+    def eightBall(self, command, user, data):
+        if not data: return
+        question = data
+        if type (question) is not str and type(question) is not unicode:
+            question = str(question)
+        question = question.strip()
+        if len (question) == 0: return
+        self.enqueueMsg("[8ball %s] %s" % (user.nick, random.choice(eight_choices)))
 
     def playlist(self, tag, data):
         for v in data:
@@ -668,6 +752,22 @@ class SynchtubeClient(object):
         nick = data[1]
         #self.logger.debug("%s nick: %s (was: %s)", sid, nick, self.userlist[sid].nick)
         self.userlist[sid]= self.userlist[sid]._replace(nick=nick)
+        if not valid:
+            self.nameKick(sid)
+
+        user = self.userlist[sid]
+        user.nicks.append(time.time())
+        span = user.nicks[-1] - user.nicks[0]
+        if span < self.spam_interval * user.nicks.maxlen * 2 and len(user.nicks) == user.nicks.maxlen:
+            if self.pending.has_key(sid) or user.mod or user.sid == self.sid:
+                return
+            else:
+                self.pending[sid] = True
+                self.logger.info("Attempted kick of %s for nick spam", user.nick)
+                reason = "%s changed nick %d times in %1.3f seconds" % (user.nick, len(user.nicks), span)
+                def kickUser():
+                    self._kickUser(sid, reason)
+                self.asLeader(kickUser)
 
     def addUser(self, tag, data):
         # add_user and users data are similar aside from users having
@@ -690,11 +790,12 @@ class SynchtubeClient(object):
 
     def send(self, tag='', data=''):
         buf = []
-        if tag:
-            buf.append(tag)
-            if data:
-                buf.append(data)
-        buf = json.dumps(buf)
+        buf.append(tag)
+        buf.append(data)
+        try:
+            buf = json.dumps(buf, encoding="utf-8")
+        except UnicodeDecodeError:
+            buf = json.dumps(buf, encoding="iso-8859-15")
         self.client.send(3, data=buf)
 
     def selfInfo(self, tag, data):
@@ -733,11 +834,11 @@ class SynchtubeClient(object):
         self.logger.info ("Kick Target %s Requestor %s", target, user)
         if len(args) > 1:
             def kickUser():
-                self._kickUser(target.sid, args[1])
+                self._kickUser(target.sid, args[1], False)
             self.asLeader(kickUser)
         else:
             def kickUser():
-                self._kickUser(target.sid)
+                self._kickUser(target.sid, sendMessage=False)
             self.asLeader(kickUser)
 
     def changeLeader(self, sid):
@@ -768,6 +869,9 @@ class SynchtubeClient(object):
         msg = data[1]
         self.chat_logger.info("%s: %s" , user.nick, msg)
 
+        if not user.sid == self.sid and self.irc_nick:
+            self.irc_queue.append("(" + user.nick + ") " + msg)
+
         if len(msg) > 0 and msg[0] == '$':
             line = msg[1:].split(' ', 1)
             command = line [0]
@@ -782,12 +886,9 @@ class SynchtubeClient(object):
             else:
                 fn(command, user, arg)
 
-        if not user.sid == self.sid and self.irc_nick:
-            self.irc_queue.append("(" + user.nick + ") " + msg)
-
         user.msgs.append(time.time())
         span = user.msgs[-1] - user.msgs[0]
-        if span < self.spam_interval * 3 and len(user.msgs) > 2:
+        if span < self.spam_interval * user.msgs.maxlen and len(user.msgs) == user.msgs.maxlen:
             if self.pending.has_key(sid) or user.mod or user.sid == self.sid:
                 return
             else:
@@ -804,6 +905,26 @@ class SynchtubeClient(object):
             self._leaderActions()
         self.logger.debug("Leader is %s", self.userlist[data])
 
+    # Filters a string, removing invalid characters
+    # Used to sanitize nicks or video titles for printing
+    # Returns a boolean describing whether invalid characters were found
+    # As well as the filtered string
+    def filterString(self, input, isNick=False):
+        if not input: return (False, "")
+        output = []
+        value = input
+        if type (value) is not str and type(value) is not unicode:
+            value = str(value)
+        for c in value:
+            o = ord(c)
+            # Locale independent ascii alphanumeric check
+            if isNick and ((o >= 48 and o <= 57) or (o >= 97 and o <= 122) or (o >= 65 and o <= 90)):
+                output.append(c)
+            if (not isNick) and o > 31 and o != 127:
+                output.append(c)
+        return (len(output) == len(value) and len , "".join(output))
+
+>>>>>>> 947b168... Fixed a lot of issues dealing with invalid data from Synchtube:naoko/naoko.py
     # The following private API methods are fairly low level and work with
     # synchtube sid's (session ids) or raw data arrays. They will usually
     # Fire off a synchtube message without any validation. Higher-level
@@ -816,6 +937,8 @@ class SynchtubeClient(object):
     def _addUser(self, u_arr):
         userinfo = itertools.izip_longest(SynchtubeUser._fields, u_arr)
         userinfo = dict(userinfo)
+        (valid, nick) = self.filterString(userinfo['nick'], True)
+        userinfo['nick'] = nick
         userinfo['msgs'] = deque(maxlen=3)
         user = SynchtubeUser(**userinfo)
         self.userlist[user.sid] = user
@@ -823,21 +946,27 @@ class SynchtubeClient(object):
     # Add the video described by v
     def _addVideo(self, v):
         v[0] = v[0][:len(SynchtubeVidInfo._fields)]
+        (valid, title) = self.filterString(v[0][2])
+        v[0][2] = title
         v[0] = SynchtubeVidInfo(*v[0])
         v.append(None) # If an unregistered adds a video there is no name included
         v = v[:len(SynchtubeVideo._fields)]
+        (valid, name) = self.filterString(v[3], True)
+        v[3] = name
         vid = SynchtubeVideo(*v)
         self.vidlist.append(vid)
 
     # Kick user using their sid(session id)
-    def _kickUser(self, sid, reason="Requested"):
-        self.sendChat("Kicked %s: (%s)" % (self.userlist[sid].nick, reason))
+    def _kickUser(self, sid, reason="Requested", sendMessage=True):
+        if sendMessage:
+            self.enqueueMsg("Kicked %s: (%s)" % (self.userlist[sid].nick, reason))
         self.send("kick", [sid, reason])
 
     # By default none of the functions use this.
     # Don't come crying to me if the bot bans the entire channel
-    def _banUser(self, sid, reason="Requested"):
-        self.sendChat("Banned %s: (%s)" % (self.userlist[sid].nick, reason))
+    def _banUser(self, sid, reason="Requested", sendMessage=True):
+        if sendMessage:
+            self.enqueueMsg("Banned %s: (%s)" % (self.userlist[sid].nick, reason))
         self.send("ban", [sid, reason])
 
     # Perform pending pending leader actions.
@@ -859,25 +988,14 @@ class SynchtubeClient(object):
     def sendHeartBeat(self):
         self.send()
 
-# replace "ROOMNAME" with the name of the room
-config = ConfigParser.RawConfigParser()
-config.read("naoko.conf")
-room = config.get('naoko', 'room')
-nick = config.get('naoko', 'nick')
-pw   = config.get('naoko', 'pass')
-spam = float(config.get('naoko', 'spam_interval'))
-server = config.get('naoko', 'irc_server')
-channel = config.get('naoko', 'irc_channel')
-ircnick = config.get('naoko', 'irc_nick')
-ircpw = config.get('naoko', 'irc_pass')
-
-# Spin off the socket thread from the main thread.
-try:
-    t = threading.Thread(target=SynchtubeClient, args=[room, nick, pw, spam, server, channel, ircnick, ircpw])
-    t.daemon=True;
-    t.start()
-    while t.isAlive(): time.sleep(100)
-    print '\n Shutting Down'
-except (KeyboardInterrupt, SystemExit):
-    print '\n! Received keyboard interrupt'
-
+    def _getConfig(self):
+        config = ConfigParser.RawConfigParser()
+        config.read("naoko.conf")
+        self.room = config.get('naoko', 'room')
+        self.name = config.get('naoko', 'nick')
+        self.pw   = config.get('naoko', 'pass')
+        self.spam_interval = float(config.get('naoko', 'spam_interval'))
+        self.server = config.get('naoko', 'irc_server')
+        self.channel = config.get('naoko', 'irc_channel')
+        self.irc_nick = config.get('naoko', 'irc_nick')
+        self.ircpw = config.get('naoko', 'irc_pass')
