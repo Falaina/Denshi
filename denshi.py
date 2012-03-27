@@ -228,7 +228,7 @@ class WebSocket(object):
 
 # Simple Record Types for variable synchtube constructs
 SynchtubeUser = namedtuple('SynchtubeUser',
-                           ['sid', 'nick', 'uid', 'auth', 'ava', 'lead', 'mod', 'karma', 'msgs'])
+                           ['sid', 'nick', 'uid', 'auth', 'ava', 'lead', 'mod', 'karma', 'msgs', 'nickChange'])
 
 SynchtubeVidInfo = namedtuple('SynchtubeVidInfo',
                             ['site', 'vid', 'title', 'thumb', 'dur'])
@@ -759,18 +759,20 @@ class SynchtubeClient(object):
             self.nameKick(sid)
 
         user = self.userlist[sid]
-        user.nicks.append(time.time())
-        span = user.nicks[-1] - user.nicks[0]
-        if span < self.spam_interval * user.nicks.maxlen * 2 and len(user.nicks) == user.nicks.maxlen:
+        if user.nickChange:
             if self.pending.has_key(sid) or user.mod or user.sid == self.sid:
                 return
             else:
+                # Only a script/bot can change nicks multiple times
+                # TODO -- Change to ban once I confirm there are no false positives
                 self.pending[sid] = True
-                self.logger.info("Attempted kick of %s for nick spam", user.nick)
-                reason = "%s changed nick %d times in %1.3f seconds" % (user.nick, len(user.nicks), span)
+                self.logger.info("Attempted kick of %s for multiple nick changes", user.nick)
+                reason = "%s changed names multiple times" % ( user.nick)
                 def kickUser():
                     self._kickUser(sid, reason)
                 self.asLeader(kickUser)
+        else:
+            self.userlist[sid] = self.userlist[sid]._replace(nickChange=True)
 
     def addUser(self, tag, data):
         # add_user and users data are similar aside from users having
@@ -804,7 +806,8 @@ class SynchtubeClient(object):
     def selfInfo(self, tag, data):
         self._addUser(data)
         self.sid = data[0]
-        #self.send("nick", self.name)
+        if not self.pw:
+            self.send("nick", self.name)
 
     def roomSetting(self, tag, data):
         self.room_info[tag] = data
@@ -943,6 +946,7 @@ class SynchtubeClient(object):
         (valid, nick) = self.filterString(userinfo['nick'], True)
         userinfo['nick'] = nick
         userinfo['msgs'] = deque(maxlen=3)
+        userinfo['nickChange'] = False
         user = SynchtubeUser(**userinfo)
         self.userlist[user.sid] = user
 
