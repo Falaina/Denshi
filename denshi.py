@@ -357,6 +357,10 @@ class SocketIOClient(object):
             self.sendHeartBeat()
         return (msg_type, data)
 
+# Generic object that can be assigned attributes
+class Object(object):
+    pass
+
 #Basic IRC client
 #Built upon the instructions provided by http://wiki.shellium.org/w/Writing_an_IRC_bot_in_Python
 class IRCClient(object):
@@ -437,7 +441,17 @@ class SynchtubeClient(object):
         self.pending = {}
         self.pendingToss = False
         self.muted = False
-        if pw:
+        self.banTracker = {}
+        # Keep all the state information together
+        self.state = Object()
+        self.state.state = 0
+        self.state.current = None
+        self.state.time = 0
+        self.state.pauseTime = -1.0
+        self.state.dur = 0
+        self.state.previous = None
+
+        if self.pw:
             self.logger.info("Attempting to login")
             login_url = "http://www.synchtube.com/user/login"
             login_body = {'email' : name, 'password' : pw};
@@ -499,14 +513,13 @@ class SynchtubeClient(object):
         self.room_info = {}
         self.vidlist = SynchtubePlaylist()
         self.thread.close = self.close
-        self.closing = False
-        client.connect()
-        if irc_nick:
-            self.irc_queue = deque()
-            self.logger.info("Starting IRC Client")
-            self.ircclient = IRCClient(server, channel, irc_nick, ircpw)
-            self.ircthread = threading.Thread(target=SynchtubeClient._ircloop, args=[self])
-            self.ircthread.start()
+        self.closing = threading.Event()
+        # Tracks when she needs to update her playback status
+        self.playerAction = threading.Event()
+        # Tracks whether she is leading
+        # Is not triggered when she is going to give the leader position back or turn tv mode back on
+        self.leading = threading.Event()
+        self.irc_queue = deque(maxlen=0)
 
             self.bridgethread = threading.Thread (target=SynchtubeClient._bridgeloop, args=[self])
             self.bridgethread.start()
@@ -516,16 +529,24 @@ class SynchtubeClient(object):
         self.stthread = threading.Thread (target=SynchtubeClient._stloop, args=[self])
         self.stthread.start()
 
-        status = True
-        while status:
+        self.playthread = threading.Thread (target=SynchtubeClient._playloop, args=[self])
+        self.playthread.start()
+
+        if self.irc_nick:
+            self.ircthread = threading.Thread(target=SynchtubeClient._ircloop, args=[self])
+            self.ircthread.start()
+
+        while not self.closing.wait(5):
             # Sleeping first lets everything get initialized
             # The parent process will wait
             time.sleep(30)
             try:
                 status = self.stthread.isAlive()
-                status = status and (not irc_nick or self.ircthread.isAlive())
-                status = status and (not irc_nick or self.bridgethread.isAlive())
-                status = status and self.client.hbthread.isAlive()
+                status = status and (not self.irc_nick or self.ircthread.isAlive())
+                status = status and self.chatthread.isAlive()
+                # Catch the case where the client is still connecting after 5 seconds
+                status = status and (not self.client.heartBeatEvent or self.client.hbthread.isAlive())
+                status = status and self.playthread.isAlive()
             except Exception as e:
                 self.logger.error (e)
                 status = False
@@ -596,6 +617,41 @@ class SynchtubeClient(object):
                     self.sendChat(self.st_queue.popleft())
             time.sleep(self.spam_interval)
 
+    # Responsible for handling playback
+    def _playloop(self):
+        while True:
+            self.leading.wait()
+            if self.closing.isSet(): break
+            if not self.state.current:
+                self.enqueueMsg("Unknown video playing, skipping")
+                self.nextVideo()
+                time.sleep(0.05) # Sleep a bit, though yielding would be enough
+                continue
+            sleepTime = self.state.dur + (self.state.time / 1000) - time.time() + 2 # Add 2 seconds to make her less aggressive in switching
+            if sleepTime < 0:
+                sleepTime = 0
+            # If the video is paused, unpause it
+            if self.state.state == 2:
+                unpause = 0
+                if not self.state.pauseTime < 0:
+                    unpause = self.state.pauseTime - (self.state.time / 1000)
+                self.pauseTime = -1.0
+                self.logger.info ("Unpausing video %f seconds from the beginning" % (unpause))
+                self.send("s", [1, unpause])
+                sleepTime = 60
+            if self.state.state == 0:
+                time.sleep(2) # Sleep a bit to make sure people have time to load the new video
+                if not self.leading.isSet(): continue
+                self.send ("s", [1,0])
+                sleepTime = 60
+            self.logger.debug ("Waiting %f seconds for the end of the video" % (sleepTime))
+            if not self.playerAction.wait (sleepTime):
+                if self.closing.isSet(): break
+                if not self.leading.isSet(): continue
+                self.nextVideo()
+            self.playerAction.clear()
+        self.logger.info("Playback Loop Closed")
+
     def _initHandlers(self):
         self.handlers = {"<"                : self.chat,
                          "leader"           : self.leader,
@@ -616,6 +672,9 @@ class SynchtubeClient(object):
                          "pm"               : self.play,
                          "am"               : self.addMedia,
                          "cm"               : self.changeMedia,
+                         "rm"               : self.removeMedia,
+                         "mm"               : self.moveMedia,
+                         "s"                : self.changeState,
                          "playlist"         : self.playlist,
                          "initdone"         : self.ignore}
 
@@ -631,7 +690,10 @@ class SynchtubeClient(object):
                                 "choose"            : self.choose,
                                 "ask"               : self.ask,
                                 "8ball"             : self.eightBall,
-                                "kick"              : self.kick}
+                                "kick"              : self.kick,
+                                "steak"             : self.steak,
+                                "ban"               : self.ban,
+                                "skip"              : self.skip}
 
     def getUserByNick(self, nick):
         try: return self.userlist[(i for i in self.userlist if self.userlist[i].nick.lower() == nick.lower()).next()]
@@ -640,6 +702,23 @@ class SynchtubeClient(object):
     def getVideoIndexById(self, vid):
         try: return (idx for idx, ele in enumerate(self.vidlist) if ele.v_sid == vid).next()
         except StopIteration: return -1
+
+    def nextVideo(self):
+        videoIndex = self.getVideoIndexById(self.state.current)
+        if videoIndex == None:
+            videoIndex = -1
+        if len (self.vidlist) == 0:
+            self.sendMsg("Video list is empty, restarting")
+            self.close()
+        videoIndex = (videoIndex + 1) % len(self.vidlist)
+        if len(self.vidlist) > 1:
+            self.state.previous = self.state.current
+        else:
+            self.state.previous = None
+        self.logger.debug ("Advancing to next video [%s]", self.vidlist[videoIndex])
+        self.state.time = int(round(time.time() * 1000))
+        self.send("s", [2])
+        self.send("pm", self.vidlist[videoIndex].v_sid)
 
     # Enqueues a message for sending to both IRC and Synchtube
     # This should not be used for bridging chat between IRC and Synchtube
@@ -652,7 +731,13 @@ class SynchtubeClient(object):
         if self.closing:
             self.closeLock.release()
             return
-        self.closing = True
+        self.closing.set()
+        self.closeLock.release()
+        self.client.close()
+        self.leading.set()
+        self.playerAction.set()
+        if self.irc_nick:
+            self.ircclient.close()
 
     def addMedia(self, tag, data):
         self._addVideo(data)
@@ -721,6 +806,9 @@ class SynchtubeClient(object):
         if len (choices) == 0: return
         self.enqueueMsg("[Choose: %s] %s" % (choices, random.choice(choices.split())))
 
+    def steak(self, command, user, data):
+        self.enqueueMsg("There is no steak.")
+
     def ask(self, command, user, data):
         if not data: return
         question = data
@@ -744,7 +832,34 @@ class SynchtubeClient(object):
             self._addVideo(v)
         #self.logger.debug(pprint(self.vidlist))
 
+    def changeState(self, tag, data):
+        self.logger.debug("State is %s %s", tag, data)
+        if data is None:
+            self.state.state = 0
+            self.state.time = int(round(time.time() * 1000))
+        else:
+            self.state.state = data[0]
+            if self.state.state == 2:
+                self.state.pauseTime = time.time()
+                return
+            elif len (data) > 1:
+                self.state.time = data[1]
+            else:
+                self.state.time = int(round(time.time() * 1000))
+        self.playerAction.set()
+
     def play(self, tag, data):
+        if self.leading.isSet() and (not self.state.previous is None) and (not self.getVideoIndexById(self.state.previous) is None):
+            self.send ("rm", self.state.previous)
+        self.state.previous = None
+        self.state.current = data [1]
+        index = self.getVideoIndexById(self.state.current)
+        if index is None:
+            self.sendMsg("Unexpected video, restarting")
+            self.close()
+            return
+        self.state.dur = self.vidlist[index].vidinfo.dur
+        self.changeState(tag, data[2])
         self.logger.debug("Playing %s %s", tag, data)
 
     def ignore(self, tag, data):
@@ -795,8 +910,10 @@ class SynchtubeClient(object):
 
     def send(self, tag='', data=''):
         buf = []
-        buf.append(tag)
-        buf.append(data)
+        if not tag == '':
+            buf.append(tag)
+            if not data == '':
+                buf.append(data)
         try:
             buf = json.dumps(buf, encoding="utf-8")
         except UnicodeDecodeError:
@@ -811,12 +928,17 @@ class SynchtubeClient(object):
 
     def roomSetting(self, tag, data):
         self.room_info[tag] = data
+        if tag == "tv?" and self.room_info["tv?"]:
+            self.leader_sid = None
 
     def takeLeader(self):
         if self.sid == self.leader:
             self._leaderActions()
             return
-        self.send("takeleader")
+        if self.room_info["tv?"]:
+            self.send ("turnoff_tv")
+        else:
+            self.send("takeleader", self.sid)
 
     def asLeader(self, action=None, giveBack=True):
         self.leader_queue.append(action)
@@ -826,6 +948,11 @@ class SynchtubeClient(object):
                 self._tossLeader(oldLeader)
             self.pendingToss = True
             self.tossLeader = tossLeader
+        if self.room_info["tv?"] and giveBack and not self.pendingToss:
+            def turnOnTV():
+                self.send("turnon_tv")
+            self.pendingToss = True
+            self.tossLeader = turnOnTV
         self.takeLeader()
 
     def users(self, tag, data):
@@ -869,6 +996,12 @@ class SynchtubeClient(object):
         if not target: return
         self.changeLeader(target.sid)
 
+    def skip(self, command, user, data):
+        if not user.mod: return
+        # Due to the complexities of switching videos, she does not give back the leader after this
+        # TODO - Make it so she does
+        self.asLeader(self.nextVideo, False)
+
     def chat(self, tag, data):
         sid = data[0]
         user = self.userlist[sid]
@@ -909,6 +1042,10 @@ class SynchtubeClient(object):
         self.leader = data
         if self.leader == self.sid:
             self._leaderActions()
+            if not self.pendingToss:
+                self.leading.set()
+        else:
+            self.leading.clear()
         self.logger.debug("Leader is %s", self.userlist[data])
 
     # Filters a string, removing invalid characters
@@ -962,6 +1099,19 @@ class SynchtubeClient(object):
         v[3] = name
         vid = SynchtubeVideo(*v)
         self.vidlist.append(vid)
+
+    def _removeVideo(self, v):
+        idx = self.getVideoIndexById (v)
+        if idx >= 0:
+            self.vidlist.pop(idx)
+
+    def _moveVideo(self, v, after=None):
+        video = self.vidlist.pop(self.getVideoIndexById(v))
+        pos = 0
+        if after:
+            pos = self.getVideoIndexById(after) + 1
+        self.vidlist.insert(pos, video)
+        self.logger.debug ("Inserted %s after %s", video, self.vidlist[pos - 1])
 
     # Kick user using their sid(session id)
     def _kickUser(self, sid, reason="Requested", sendMessage=True):
