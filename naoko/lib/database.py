@@ -64,7 +64,7 @@ class NaokoDB(object):
     Wrapper around an sqlite3 database. Roughly analagous
     to an sqlite3.Connection.
 
- err   This is _NOT_ a subclass of sqlite3.Connection.
+    This is _NOT_ a subclass of sqlite3.Connection.
 
     Implements the context manager protocol.
     """
