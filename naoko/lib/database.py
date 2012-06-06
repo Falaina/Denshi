@@ -2,7 +2,14 @@
 
 import sqlite3
 import logging
-from settings import LOG_LEVEL
+import time
+try:
+    from naoko.settings import LOG_LEVEL
+except:
+    # This probably only happens when executing this directly
+    print "Defaulting to LOG_LEVEL debug [%s]" % (__name__)
+    LOG_LEVEL = logging.DEBUG
+
 
 ProgrammingError = sqlite3.ProgrammingError
 DatabaseError    = sqlite3.DatabaseError
@@ -57,13 +64,66 @@ class NaokoDB(object):
     Wrapper around an sqlite3 database. Roughly analagous
     to an sqlite3.Connection.
 
-    This is _NOT_ a subclass of sqlite3.Connection.
+ err   This is _NOT_ a subclass of sqlite3.Connection.
 
     Implements the context manager protocol.
     """
 
     _dbinfo_sql = "SELECT name FROM sqlite_master WHERE type='table'"
-    _required_tables = set(['video_stats', 'videos'])
+    _version_sql = "SELECT value FROM metadata WHERE key='dbversion'"
+    _required_tables = set(['video_stats', 'videos', 'chat'])
+
+    def _getTables(self):
+        with self.execute(self._dbinfo_sql) as cur:
+            return set([table[0] for table in cur.fetchall()])
+
+    def _getVersion(self):
+        tables = self._getTables()
+        if 'metadata' in tables:
+            with self.execute(self._version_sql) as cur:
+                version = cur.fetchone()[0]
+                self.logger.debug("Database version is %s" % version)
+                return int(version)
+        else: # There was no explicit version in the original database
+            self.logger.debug("Database version is 1 (no metadata table)")
+            return 1
+
+    # Upgrade version 1 of the database to version 2
+    # This approach duplicates information from naoko.sql
+    # however upgrade procedures in general should probably be done
+    # by hand
+    def _upgrade_1_2(self):
+        print "Upgrading Naoko's Database from version 1 to version 2"
+        upgrade_stmts = [
+            'CREATE TABLE metadata(key TEXT, value TEXT, PRIMARY KEY(key))',
+            'CREATE TABLE chat(timestamp INTEGER, username TEXT, userid TEXT, msg TEXT, protocol TEXT, channel TEXT, flags TEXT)',
+            'CREATE INDEX chat_ts   ON chat(timestamp)',
+            'CREATE INDEX chat_user ON chat(username)',
+            "INSERT INTO metadata(key, value) VALUES ('dbversion', '2')"]
+        for stmt in upgrade_stmts:
+            self.executeDML(stmt)
+
+    def _setupSchema(self):
+        tables = self._getTables()
+        # run self.initscript if we have an empty db (one with no tables)
+        if len(tables) is 0:
+            self.initdb()
+        else:
+            # DATABASE_UPGRADE
+            # Try and sensibly handle upgrades from a lower version of the
+            # database to a higher one. Currently only 1->2 is supported
+            # and as this upgrade is non-destructive, we can just
+            # run the init script and ignore errors. this may change in
+            # the future.
+            version = self._getVersion()
+            if version == 1:
+                self._upgrade_1_2()
+            elif version == 2:
+                pass # database schema is current
+            else:
+                self.logger.warn("UNKNOWN DATABASE VERSION: %s" % (version))
+         
+
 
     # Low level database handling methods
     def __enter__(self):
@@ -77,16 +137,8 @@ class NaokoDB(object):
         self.con = sqlite3.connect(database)
         self._state = "open"
 
-        def getTables():
-            with self.execute(self._dbinfo_sql) as cur:
-                return set([table[0] for table in cur.fetchall()])
-
-        tables = set(getTables())
-
-        # run self.initscript if we have an empty db (one with no tables)
-        if len(tables) is 0:
-            self.initdb()
-            tables = set(getTables())
+        self._setupSchema()
+        tables = self._getTables()
 
         if not self._required_tables <= tables:
             raise ValueError("Database '%s' is non-empty but "
@@ -260,11 +312,66 @@ class NaokoDB(object):
             binds += (num,)
         elif  num != None:
             raise ProgrammingError("Invalid num %s" % (num))
-
+                                 
         self.logger.debug("Generated SQL %s" % (sql))
 
         with self.execute(sql, binds) as cur:
             return cur.fetchall()
+
+    def insertChat(self, msg, username, userid=None, timestamp=None, 
+                   protocol='ST', channel=None, flags=None):
+        """
+        Insert chat message into the chat table of Naoko's database.
+
+        msg is the chat message to be inserted.
+
+        username is the sender of the chat message.
+
+        userid is the userid of the sender of the chat message. This may
+        not make sense for all protocols. By default it is None.
+
+        timestamp is the timestamp the message was received. If None
+        timestamp will default to the time insertChat was called.
+
+        proto is the protocol over which the message was sent. The
+        default protocol is 'ST'.
+
+        channel is the channel or room for which the message was 
+        intended. The default is None.
+
+        flags are any miscellaneous flags attached to the user/message.
+        this is intended to denote things such as emotes, video adds, etc.
+        By default it is None.
+        """
+        if userid is None:
+            userid = username
+        if timestamp is None:
+            timestamp = int(time.time())
+            
+        chat = (timestamp, username, userid, msg, protocol, channel, flags)
+        with self.cursor() as cur:
+            self.logger.debug("Inserting chat message %s" % (chat,))
+            cur.execute("INSERT INTO chat VALUES(?, ?, ?, ?, ?, ?, ?)", chat)
+        self.commit()
+
+            
+def _upgrade_tests(db):
+    print "**Testing database upgrades"                                     
+    assert db._getVersion() == 2, "Newly created database NOT version 2"
+    
+    # Simulate a dbversion 1 database by deleting new tables
+    print "**Downgrading database to version 1"
+    with db.cursor() as cur:
+        drop_tables  = ('metadata', 'chat')
+        for table in drop_tables:
+            print "**Dropping %s" % (table,)
+            cur.execute("DROP TABLE %s" % (table,))
+            
+    assert db._getVersion() == 1, "Downgraded database NOT version 1"
+    db._setupSchema()
+    assert db._getVersion() == 2, "Upgraded database NOT version 2"  
+    print "**UPGRADE TESTS SUCCEEDED\n\n\n"
+                           
 
 # Run some tests if called directly
 if __name__ == '__main__':
@@ -286,7 +393,35 @@ if __name__ == '__main__':
 
     print "**Testing database creation with :memory: database"
 
-    with NaokoDB(':memory:', file('../naoko.sql').read()) as db:
+    with NaokoDB(':memory:', file('naoko.sql').read()) as db:
+        _upgrade_tests(db)
+
+        print "**Testing chat message insertion"
+        # Test defaults
+        db.insertChat('Message 2', 'falaina')
+
+        # Trivial test
+        db.insertChat('Message 1', 'Kaworu', userid=None, timestamp='1',
+                      protocol='IRC', channel='Denshi', flags='o')
+
+        with db.cursor() as cur:
+            cur.execute('SELECT * FROM chat ORDER by timestamp');
+
+            rows = cur.fetchall()
+            print "**Retrieved rows: %s" % (rows,)
+
+            assert len(rows) == 2, 'Inserted 2 rows, but did not retrieve 2'
+            
+            # The first message should be Kaworu: Message 1 due to 
+            # a timestamp of 1
+            assert rows[0][0] is 1, 'Incorrect timestamp'
+            assert rows[0][1] == 'Kaworu', 'Incorrect name for Kaworu'
+
+            # Second message should be Falaina: Message 2
+            assert rows[1][3] == 'Message 2', 'Incorrect message for Falaina'
+            assert rows[1][4] == 'ST', 'Incorrect protocol for Falaina'
+
+        print "**CHAT TESTS SUCCEEDED\n\n\n"
         with db.cursor() as cur:
             print "**Inserting videos into database: %s" % (vids)
             cur.executemany("INSERT INTO videos VALUES(?, ?, ?, ?)", vids)
@@ -354,3 +489,6 @@ if __name__ == '__main__':
             raise AssertionError("reversed rows not actually reversed\n"
                         "[Actual:   %s]\n[Expected: %s]"
                         % (reversed_rows, expected_rows))
+        print "**VIDEO TESTS SUCCEEDED\n\n\n"
+
+
