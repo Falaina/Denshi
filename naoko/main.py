@@ -61,10 +61,12 @@ def run(script):
         print "Received exception ", str(e)
     finally:
         child.terminate()
-
-if __name__ == '__main__':
+def main():
     try:
         while True:
             run(Naoko)
     except KeyboardInterrupt:
         print "\n Shutting Down"
+    
+if __name__ == '__main__':
+    main()

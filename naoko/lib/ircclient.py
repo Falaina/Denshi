@@ -4,7 +4,7 @@ import logging
 import socket
 import re
 
-from settings import *
+from ..settings import *
 
 #Basic IRC client
 #Built upon the instructions provided by http://wiki.shellium.org/w/Writing_an_IRC_bot_in_Python

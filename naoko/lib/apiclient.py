@@ -7,7 +7,7 @@ from ssl import SSLError
 from urllib import urlencode
 from httplib import HTTPConnection, HTTPSConnection
 
-from settings import *
+from ..settings import *
 
 
 # A client for all the various APIs used by Naoko

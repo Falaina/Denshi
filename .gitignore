@@ -3,3 +3,4 @@
 *.swp
 cbclient.py
 persistentsettings
+build

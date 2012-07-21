@@ -10,7 +10,7 @@ import struct
 import threading
 from urllib import urlopen, urlencode
 
-from settings import *
+from ..settings import *
 
 # Implementation of WebSocket client as per draft-ietf-hybi-thewebsocketprotocol-00
 # http://tools.ietf.org/html/draft-ietf-hybi-thewebsocketprotocol-00
